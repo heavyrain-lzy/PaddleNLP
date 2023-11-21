@@ -177,6 +177,11 @@ def process_strategy(config):
         fused_passes = strategy.fused_passes
         fused_passes.enable = len(fused_passes_list) > 0
         fused_passes.fused_passes_list = fused_passes_list
+        # fused_promotion config
+        fused_promotion = config.FusedPasses.pop("fused_promotion", False)
+        fused_promotion_pass = strategy.fused_promotion
+        # only support promote the fused_linear
+        fused_promotion_pass.enable = fused_promotion and fused_linear
 
     if config.get("Model", None) is not None:
         # recompute config

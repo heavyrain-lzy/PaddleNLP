@@ -71,6 +71,8 @@ __all__ = [
     "LlamaPretrainingCriterionAuto",
 ]
 
+use_refined_recompute = True
+
 
 def get_dist_attr(shard_specs, pp_idx=0):
     mesh = fleet.auto.get_mesh()
@@ -248,12 +250,20 @@ class LlamaMLPAuto(nn.Layer):
             fleet.auto.shard_tensor(self.up_proj.weight, *get_dist_attr([None, "mp"], self.ipp))
 
         fleet.auto.shard_tensor(self.down_proj.weight, *get_dist_attr(["mp", None], self.ipp))
-
+        # print("++++ self.fuse_attention_ffn: ", self.fuse_attention_ffn)
         if self.fuse_attention_ffn:
             gate_out, up_out = paddle.chunk(self.gate_up_fused_proj(x), chunks=2, axis=-1)
             out = self.down_proj(F.silu(gate_out) * up_out)
         else:
-            out = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+            if use_refined_recompute:
+                # if False:
+                # out = fleet.auto.exclude_ops_in_recompute(self.down_proj)(F.silu(fleet.auto.exclude_ops_in_recompute(self.gate_proj)(x)) * fleet.auto.exclude_ops_in_recompute(self.up_proj)(x))
+                out = fleet.auto.exclude_ops_in_recompute(self.down_proj)(
+                    fleet.auto.exclude_ops_in_recompute(F.silu)(fleet.auto.exclude_ops_in_recompute(self.gate_proj)(x))
+                    * fleet.auto.exclude_ops_in_recompute(self.up_proj)(x)
+                )
+            else:
+                out = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         return out
 
 
@@ -333,6 +343,7 @@ class LlamaAttentionAuto(nn.Layer):
         self.config = config
 
     def _init_rope(self):
+        print("+++ self.config.rope_scaling_type: {}".format(self.config.rope_scaling_type))
         if self.config.rope_scaling_type is None:
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
@@ -371,7 +382,7 @@ class LlamaAttentionAuto(nn.Layer):
     ) -> Tuple[paddle.Tensor, Optional[paddle.Tensor], Optional[Tuple[paddle.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         # [bs, seq_len, num_head * head_dim] -> [seq_len / n, bs, num_head * head_dim] (n is model parallelism)
-
+        # print("++++ self.fuse_attention_qkv: {}".format(self.fuse_attention_qkv))
         if self.fuse_attention_qkv:
             target_shape = [0, 0, self.num_heads, 3 * self.head_dim]
 
@@ -387,16 +398,31 @@ class LlamaAttentionAuto(nn.Layer):
             fleet.auto.shard_tensor(self.q_proj.weight, *get_dist_attr([None, "mp"], self.ipp))
             fleet.auto.shard_tensor(self.k_proj.weight, *get_dist_attr([None, "mp"], self.ipp))
             fleet.auto.shard_tensor(self.v_proj.weight, *get_dist_attr([None, "mp"], self.ipp))
-
-            query_states = self.q_proj(hidden_states).reshape(shape=target_query_shape)
-            key_states = self.k_proj(hidden_states).reshape(shape=target_key_value_shape)
-            value_states = self.v_proj(hidden_states).reshape(shape=target_key_value_shape)
+            if use_refined_recompute:
+                # if False:
+                query_states = fleet.auto.exclude_ops_in_recompute(self.q_proj)(hidden_states)
+                query_states = fleet.auto.exclude_ops_in_recompute(paddle.reshape_)(
+                    query_states, shape=target_query_shape
+                )
+                key_states = fleet.auto.exclude_ops_in_recompute(self.k_proj)(hidden_states)
+                key_states = fleet.auto.exclude_ops_in_recompute(paddle.reshape_)(
+                    key_states, shape=target_key_value_shape
+                )
+                value_states = fleet.auto.exclude_ops_in_recompute(self.v_proj)(hidden_states)
+                value_states = fleet.auto.exclude_ops_in_recompute(paddle.reshape_)(
+                    value_states, shape=target_key_value_shape
+                )
+            else:
+                query_states = self.q_proj(hidden_states).reshape(shape=target_query_shape)
+                key_states = self.k_proj(hidden_states).reshape(shape=target_key_value_shape)
+                value_states = self.v_proj(hidden_states).reshape(shape=target_key_value_shape)
 
         kv_seq_len = key_states.shape[-3]
 
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-3]
 
+        # print(f"+++ self.use_fused_rope: {self.use_fused_rope}")
         if self.config.rope:
             if self.use_fused_rope:
                 assert past_key_value is None, "fuse rotary not support cache kv for now"
@@ -411,8 +437,15 @@ class LlamaAttentionAuto(nn.Layer):
                     use_neox_rotary_style=False,
                 )
             else:
-                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+                # if use_refined_recompute:
+                if False:
+                    cos, sin = fleet.auto.exclude_ops_in_recompute(self.rotary_emb)(value_states, seq_len=kv_seq_len)
+                    query_states, key_states = fleet.auto.exclude_ops_in_recompute(apply_rotary_pos_emb)(
+                        query_states, key_states, cos, sin, position_ids
+                    )
+                else:
+                    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # [bs, seq_len, num_head, head_dim]
         if past_key_value is not None:
@@ -449,15 +482,27 @@ class LlamaAttentionAuto(nn.Layer):
                 use_reentrant=self.config.recompute_use_reentrant,
             )
         else:
-            outputs = scaled_dot_product_attention(
-                query_states,
-                self.config,
-                key_states,
-                value_states,
-                attention_mask,
-                output_attentions,
-                alibi,
-            )
+            # if use_refined_recompute:
+            if False:
+                outputs = fleet.auto.exclude_ops_in_recompute(scaled_dot_product_attention)(
+                    query_states,
+                    self.config,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    output_attentions,
+                    alibi,
+                )
+            else:
+                outputs = scaled_dot_product_attention(
+                    query_states,
+                    self.config,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    output_attentions,
+                    alibi,
+                )
         if output_attentions:
             attn_output, attn_weights = outputs
         else:
@@ -466,7 +511,11 @@ class LlamaAttentionAuto(nn.Layer):
         # if sequence_parallel is true, out shape are [q_len / n, bs, num_head * head_dim]
         # else their shape are [bs, q_len, num_head * head_dim], n is mp parallelism.
         fleet.auto.shard_tensor(self.o_proj.weight, *get_dist_attr(["mp", None], self.ipp))
-        attn_output = self.o_proj(attn_output)
+        if use_refined_recompute:
+            # if False:
+            attn_output = fleet.auto.exclude_ops_in_recompute(self.o_proj)(attn_output)
+        else:
+            attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -687,36 +736,37 @@ class LlamaPretrainedModelAuto(PretrainedModel):
 
     def _init_weights(self, layer):
         """Initialization hook"""
-        if isinstance(
-            layer,
-            (
-                nn.Linear,
-                nn.Embedding,
-                LlamaLMHeadAuto,
-            ),
-        ):
-            # In the dygraph mode, use the `set_value` to reset the parameter directly,
-            # and reset the `state_dict` to update parameter in static mode.
-            if isinstance(layer.weight, paddle.Tensor):
-                layer.weight.set_value(
-                    paddle.tensor.normal(
-                        mean=0.0,
-                        std=self.config.initializer_range
-                        if hasattr(self.config, "initializer_range")
-                        else self.llama.config.initializer_range,
-                        shape=layer.weight.shape,
-                    )
-                )
-        # Layer.apply is DFS https://github.com/PaddlePaddle/Paddle/blob/a6f5021fcc58b21f4414bae6bf4731ef6971582c/python/paddle/nn/layer/layers.py#L527-L530
-        # sublayer is init first
-        # scale RowParallelLinear weight
-        with paddle.no_grad():
-            if isinstance(layer, LlamaMLPAuto):
-                factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
-                layer.down_proj.weight.scale_(factor)
-            if isinstance(layer, LlamaAttentionAuto):
-                factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
-                layer.o_proj.weight.scale_(factor)
+        return
+        # if isinstance(
+        #     layer,
+        #     (
+        #         nn.Linear,
+        #         nn.Embedding,
+        #         LlamaLMHeadAuto,
+        #     ),
+        # ):
+        #     # In the dygraph mode, use the `set_value` to reset the parameter directly,
+        #     # and reset the `state_dict` to update parameter in static mode.
+        #     if isinstance(layer.weight, paddle.Tensor):
+        #         layer.weight.set_value(
+        #             paddle.tensor.normal(
+        #                 mean=0.0,
+        #                 std=self.config.initializer_range
+        #                 if hasattr(self.config, "initializer_range")
+        #                 else self.llama.config.initializer_range,
+        #                 shape=layer.weight.shape,
+        #             )
+        #         )
+        # # Layer.apply is DFS https://github.com/PaddlePaddle/Paddle/blob/a6f5021fcc58b21f4414bae6bf4731ef6971582c/python/paddle/nn/layer/layers.py#L527-L530
+        # # sublayer is init first
+        # # scale RowParallelLinear weight
+        # with paddle.no_grad():
+        #     if isinstance(layer, LlamaMLPAuto):
+        #         factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
+        #         layer.down_proj.weight.scale_(factor)
+        #     if isinstance(layer, LlamaAttentionAuto):
+        #         factor = 1 / math.sqrt(2 * self.config.num_hidden_layers)
+        #         layer.o_proj.weight.scale_(factor)
 
 
 @register_base_model

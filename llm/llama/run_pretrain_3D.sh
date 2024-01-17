@@ -16,7 +16,7 @@
 
 set -x
 unset CUDA_VISIBLE_DEVICES
-
+# export GLOG_v=6
 export FLAGS_call_stack_level=3
 # export FLAGS_use_cuda_managed_memory=true
 
@@ -30,7 +30,8 @@ export PYTHONPATH=../../:$PYTHONPATH
 # export GLOG_v=4
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-rm -rf auto_dp$1_mp$2_pp$3
+log_dir=semi_auto_dp$1_mp$2_pp$3_fp16_o1
+rm -rf $log_dir
 
 gpus=""
 num=$(expr $1 \* $2 \* $3 - 1)
@@ -54,7 +55,7 @@ gpu=${gpu:1}
 # export GLOG_v=10
 python -u  -m paddle.distributed.launch \
     --gpus $gpu \
-    --log_dir "auto_dp$1_mp$2_pp$3" \
+    --log_dir $log_dir \
     run_pretrain_3D_auto.py \
     --model_type "llama" \
     --model_name_or_path "facebook/llama-7b" \
@@ -62,21 +63,21 @@ python -u  -m paddle.distributed.launch \
     --input_dir "./data" \
     --output_dir "output/$task_name" \
     --split 949,50,1 \
-    --max_seq_length 2048 \
+    --max_seq_length 1024 \
     --per_device_train_batch_size $train_bsz \
     --per_device_eval_batch_size $eval_bsz \
     --gradient_accumulation_steps $acc_steps \
     --use_flash_attention 0 \
     --use_fused_rms_norm 0 \
-    --fp16 0 \
-    --fp16_opt_level "O2"  \
+    --fp16 20 \
+    --fp16_opt_level "O1"  \
     --scale_loss 1024 \
     --pipeline_parallel_degree $3 \
     --tensor_parallel_degree $2 \
     --sharding_parallel_degree 1 \
     --learning_rate 0.0001 \
     --min_learning_rate 0.00001 \
-    --max_steps 25 \
+    --max_steps 1 \
     --save_steps 5000000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \

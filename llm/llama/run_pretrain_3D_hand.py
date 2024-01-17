@@ -17,8 +17,8 @@ GPT/Llama auto parallel pretraining scripts.
 import os
 import random
 import sys
-import types
 import time
+import types
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -274,12 +274,18 @@ def create_pretrained_dataset(
 
     return train_dataset, valid_dataset, test_dataset, _collate_data
 
+
 def print_memory_usage(message=""):
-    mem_alloc = paddle.device.cuda.memory_allocated() / (2 ** 30)
-    max_mem_alloc = paddle.device.cuda.max_memory_allocated() / (2 ** 30)
-    max_mem_reserve = paddle.device.cuda.memory_reserved() / (2 ** 30)
-    max_mem_reserve = paddle.device.cuda.max_memory_reserved() / (2 ** 30)
-    print("============== {}: allocated: {} GB, max_allocated: {} GB, reserved: {} GB, max_reserved: {} GB,".format(message, mem_alloc, max_mem_alloc, mem_reserve, max_mem_reserve))
+    mem_alloc = paddle.device.cuda.memory_allocated() / (2**30)
+    max_mem_alloc = paddle.device.cuda.max_memory_allocated() / (2**30)
+    max_mem_reserve = paddle.device.cuda.memory_reserved() / (2**30)
+    max_mem_reserve = paddle.device.cuda.max_memory_reserved() / (2**30)
+    print(
+        "============== {}: allocated: {} GB, max_allocated: {} GB, reserved: {} GB, max_reserved: {} GB,".format(
+            message, mem_alloc, max_mem_alloc, mem_reserve, max_mem_reserve
+        )
+    )
+
 
 def get_train_data_file(args):
     if len(args.input_dir.split()) > 1:
@@ -473,7 +479,7 @@ def main():
     if model_args.no_recompute_layers is not None:
         model_args.no_recompute_layers.sort()
 
-    # config.num_hidden_layers = 8
+    config.num_hidden_layers = 8
     config.use_flash_attention = model_args.use_flash_attention
     config.use_fused_rms_norm = model_args.use_fused_rms_norm
     config.fuse_attention_qkv = model_args.fuse_attention_qkv
@@ -629,7 +635,7 @@ def main():
             pp_data_buffer.clear()
 
             if global_step % training_args.logging_steps == 0:
-                num_steps = (global_step - global_step_last_logged)
+                num_steps = global_step - global_step_last_logged
                 total_train_batch_size = training_args.per_device_train_batch_size * training_args.data_parallel_degree
                 logs = {}
                 logs["loss"] = float(0)
@@ -639,7 +645,9 @@ def main():
                     speed_metrics(
                         split="interval",
                         start_time=start_time_last_logged,
-                        num_samples=total_train_batch_size * (global_step - global_step_last_logged) * training_args.gradient_accumulation_steps,
+                        num_samples=total_train_batch_size
+                        * (global_step - global_step_last_logged)
+                        * training_args.gradient_accumulation_steps,
                         num_steps=num_steps,
                     )
                 )

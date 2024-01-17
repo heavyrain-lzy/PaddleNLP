@@ -14,11 +14,12 @@
 """
 GPT/Llama auto parallel pretraining scripts.
 """
+import contextlib
 import os
 import random
 import sys
-import types
 import time
+import types
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -268,7 +269,7 @@ class AutoClipGradByGlobalNorm(paddle.nn.ClipGradByGlobalNorm):
         def async_add_n(var_list):
             # for var in var_list:
             #     print("async_add_n, var: ", var, ", initialized: ", var._is_initialized(), "****" * 40)
-            
+
             return paddle.stack(var_list).sum()
 
         sum_dtype = "float64" if len(sum_square_list) > 0 else "float32"
@@ -407,12 +408,18 @@ def create_pretrained_dataset(
 
     return train_dataset, valid_dataset, test_dataset, _collate_data
 
+
 def print_memory_usage(message=""):
-    mem_alloc = paddle.device.cuda.memory_allocated() / (2 ** 30)
-    max_mem_alloc = paddle.device.cuda.max_memory_allocated() / (2 ** 30)
-    mem_reserve = paddle.device.cuda.memory_reserved() / (2 ** 30)
-    max_mem_reserve = paddle.device.cuda.max_memory_reserved() / (2 ** 30)
-    print("============== {}: allocated: {} GB, max_allocated: {} GB, reserved: {} GB, max_reserved: {} GB,".format(message, mem_alloc, max_mem_alloc, mem_reserve, max_mem_reserve))
+    mem_alloc = paddle.device.cuda.memory_allocated() / (2**30)
+    max_mem_alloc = paddle.device.cuda.max_memory_allocated() / (2**30)
+    mem_reserve = paddle.device.cuda.memory_reserved() / (2**30)
+    max_mem_reserve = paddle.device.cuda.max_memory_reserved() / (2**30)
+    print(
+        "============== {}: allocated: {} GB, max_allocated: {} GB, reserved: {} GB, max_reserved: {} GB,".format(
+            message, mem_alloc, max_mem_alloc, mem_reserve, max_mem_reserve
+        )
+    )
+
 
 def get_train_data_file(args):
     if len(args.input_dir.split()) > 1:
@@ -533,6 +540,38 @@ def shard_fn(layer, mesh_idx, placements):
     layer.weight.name = paran_name
 
 
+def autocast_smart_context_manager(train_args):
+    """
+    A helper wrapper that creates an appropriate context manager for `autocast` while feeding it the desired
+    arguments, depending on the situation.
+    """
+    if train_args.fp16 or train_args.bf16:
+        amp_dtype = "float16" if train_args.fp16 else "bfloat16"
+        custom_black_list = ["reduce_sum", "c_softmax_with_cross_entropy"]
+        custom_white_list = []
+        if train_args.fp16_opt_level == "O2":
+            # https://github.com/PaddlePaddle/Paddle/blob/eb97f4f0adca40b16a309b927e480178beb8ae96/python/paddle/amp/amp_lists.py#L85-L86
+            # the lookup_table is in black_list, but in O2, we need it return fp16
+            custom_white_list.extend(["lookup_table", "lookup_table_v2"])
+
+        if train_args.amp_custom_white_list is not None:
+            custom_white_list.extend(train_args.amp_custom_white_list)
+        if train_args.amp_custom_black_list is not None:
+            custom_black_list.extend(train_args.amp_custom_black_list)
+
+        ctx_manager = paddle.amp.auto_cast(
+            True,
+            custom_black_list=set(custom_black_list),
+            custom_white_list=set(custom_white_list),
+            level=train_args.fp16_opt_level,
+            dtype=amp_dtype,
+        )
+    else:
+        ctx_manager = contextlib.nullcontext() if sys.version_info >= (3, 7) else contextlib.suppress()
+
+    return ctx_manager
+
+
 def main():
     parser = PdArgumentParser((ModelArguments, DataArguments, PreTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -587,7 +626,7 @@ def main():
     if model_args.no_recompute_layers is not None:
         model_args.no_recompute_layers.sort()
 
-    # config.num_hidden_layers = 8
+    config.num_hidden_layers = 8
     config.use_flash_attention = model_args.use_flash_attention
     config.use_fused_rms_norm = model_args.use_fused_rms_norm
     config.fuse_attention_qkv = model_args.fuse_attention_qkv
@@ -621,7 +660,9 @@ def main():
 
     print("======M M M M======", model_class)
     print_memory_usage("Before Init Whole LLaMa Model")
-    model = model_class._from_config(config, dtype=dtype)
+    model = model_class._from_config(config, dtype="float32")
+    if training_args.fp16_opt_level == "O2":
+        paddle.amp.decorate(models=model, level=training_args.fp16_opt_level, dtype=dtype)
     print_memory_usage("After Init Whole LLaMa Model")
     # load model
     # load_model(model)
@@ -630,7 +671,7 @@ def main():
 
     # for name, param in model.named_paramters:
     #     print(f"name: {name}, param initialized: {param._is_initialized()}")
-    
+
     # Create the learning_rate sheduler and optimizer
     if training_args.decay_steps is None:
         training_args.decay_steps = training_args.max_steps
@@ -705,13 +746,14 @@ def main():
     global_step = 1
     global_step_last_logged = global_step
     tr_loss = float(0)
+    scaler = paddle.amp.GradScaler(init_loss_scaling=1024)
 
     # hack: create dp group for distributed input data to align dygraph parallel loss.
     dp_group = None
     if "dp" in fleet.auto.get_mesh().dim_names:
-        global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh 
-    # global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh
-        global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh 
+        global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh
+        # global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh
+        global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh
         mesh_shape = global_mesh.shape
         for id in range(mesh_shape[0]):
             if len(mesh_shape) > 2:
@@ -759,17 +801,19 @@ def main():
                 dist.all_gather(res, paddle.Tensor(labels, place=paddle.CUDAPlace(cur_rank)), group=dp_group)
                 labels = paddle.concat(res)
                 labels = dist.shard_tensor(labels, get_mesh(-1), placements)
-
-            res = model(input_ids, labels=labels)
+            with autocast_smart_context_manager(train_args=training_args):
+                res = model(input_ids, labels=labels)
 
             # add criterion in the future.
             tr_loss_step = res[0]
 
             if training_args.gradient_accumulation_steps > 1:
                 tr_loss_step /= training_args.gradient_accumulation_steps
-
-            # do backward every micro step.
-            tr_loss_step.backward()
+            if training_args.fp16:
+                scaler.scale(tr_loss_step).backward()
+            else:
+                # do backward every micro step.
+                tr_loss_step.backward()
             tr_loss += tr_loss_step
 
             if global_step % training_args.gradient_accumulation_steps == 0:
@@ -784,8 +828,10 @@ def main():
                 # tr_loss = 0
 
                 if (global_step % training_args.gradient_accumulation_steps) % training_args.logging_steps == 0:
-                    num_steps = (global_step - global_step_last_logged)
-                    total_train_batch_size = training_args.per_device_train_batch_size * training_args.data_parallel_degree
+                    num_steps = global_step - global_step_last_logged
+                    total_train_batch_size = (
+                        training_args.per_device_train_batch_size * training_args.data_parallel_degree
+                    )
                     logs = {}
                     logs["loss"] = tr_loss.numpy()
                     logs["learning_rate"] = float("{0:.3e}".format(optimizer.get_lr()))
@@ -798,6 +844,7 @@ def main():
                             num_steps=num_steps,
                         )
                     )
+                    tr_loss = 0
                     logger.info(", ".join(f"{k}: {v}" for k, v in logs.items()))
 
                     global_step_last_logged = global_step
@@ -806,7 +853,6 @@ def main():
 
                 if (global_step // training_args.gradient_accumulation_steps) >= training_args.max_steps:
                     break
-
 
             # if global_step // training_args.gradient_accumulation_steps >= 1:
             #     sys.exit(0)

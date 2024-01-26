@@ -325,6 +325,8 @@ def create_optimizer(model, lr_scheduler, training_args):
         return x in decay_parameters
 
     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
+    if hasattr(optimizer_cls, "_create_master_weight") and training_args.fp16_opt_level == "O2":
+        optimizer_kwargs["multi_precision"] = True
     optimizer = optimizer_cls(
         learning_rate=lr_scheduler if lr_scheduler is None else lr_scheduler,
         apply_decay_param_fun=apply_decay_param_fun,
@@ -489,18 +491,23 @@ def main():
     print("Final pre-training config:", config)
 
     # Set the dtype for loading model
-    dtype = "float32"
-    if training_args.fp16_opt_level == "O2":
-        if training_args.fp16:
-            dtype = "float16"
-        if training_args.bf16:
-            dtype = "bfloat16"
+    # dtype = "float32"
+    # if training_args.fp16_opt_level == "O2":
+    #     if training_args.fp16:
+    #         dtype = "float16"
+    #     if training_args.bf16:
+    #         dtype = "bfloat16"
 
     print("======M M M M======", model_class)
-    model = model_class._from_config(config, dtype=dtype)
+    model = model_class._from_config(config, dtype="float32")
+    amp_enable = False
+    if training_args.fp16 or training_args.bf16:
+        amp_enable = True
+    amp_dtype = "float16" if training_args.fp16 else "bfloat16"
+
     # load model
     # load_model(model)
-    shard_model(model)
+    shard_model(model, training_args)
     # Create the learning_rate sheduler and optimizer
     if training_args.decay_steps is None:
         training_args.decay_steps = training_args.max_steps
@@ -534,6 +541,14 @@ def main():
     )
 
     optimizer = create_optimizer(model, lr_scheduler, training_args)
+    if amp_enable:
+        model, optimizer = paddle.amp.decorate(
+            models=model,
+            optimizers=optimizer,
+            level=training_args.fp16_opt_level,
+            dtype=amp_dtype,
+            master_grad=training_args.amp_master_grad,
+        )
 
     def loss_func(loss, outputs):
         return loss
@@ -572,20 +587,25 @@ def main():
 
     global_step = 1
     tr_loss = float(0)
+    scaler = None
+    if training_args.fp16:
+        scaler = paddle.amp.GradScaler(init_loss_scaling=training_args.scale_loss)
+        scaler = dist.shard_gradscaler(scaler)
 
     # hack: create dp group for distributed input data to align dygraph parallel loss.
     dp_group = None
     global_mesh = fleet.auto.get_mesh().get_mesh_with_dim("pp").mesh
     mesh_shape = global_mesh.shape
-    for id in range(mesh_shape[0]):
-        pp_mesh = global_mesh[id]
-        for i in range(pp_mesh.shape[-1]):
-            ranks = pp_mesh[:, i]
-            print("dp ranks: ", ranks)
-            group = dist.new_group(ranks)
-            if dist.get_rank() in ranks:
-                dp_group = group
-    assert dp_group is not None
+    if training_args.sharding_parallel_degree > 1:
+        for id in range(mesh_shape[0]):
+            pp_mesh = global_mesh[id]
+            for i in range(pp_mesh.shape[-1]):
+                ranks = pp_mesh[:, i]
+                print("dp ranks: ", ranks)
+                group = dist.new_group(ranks)
+                if dist.get_rank() in ranks:
+                    dp_group = group
+        assert dp_group is not None
 
     model.train()
     optimizer = dist.shard_optimizer(optimizer)
@@ -608,8 +628,15 @@ def main():
                 dist.all_gather(res, paddle.Tensor(labels, place=paddle.CUDAPlace(cur_rank)), group=dp_group)
                 labels = paddle.concat(res)
                 labels = dist.shard_tensor(labels, get_mesh(-1), [dist.Shard(0), dist.Replicate()])
-
-            res = model(input_ids, labels=labels)
+            with paddle.amp.auto_cast(
+                amp_enable,
+                training_args.amp_custom_white_list,
+                training_args.amp_custom_black_list,
+                level=training_args.fp16_opt_level,
+                dtype=amp_dtype,
+                use_promote=True,
+            ):
+                res = model(input_ids, labels=labels)
 
             # add criterion in the future.
             tr_loss_step = res[0]
@@ -618,12 +645,19 @@ def main():
                 tr_loss_step /= training_args.gradient_accumulation_steps
 
             # do backward every micro step.
-            tr_loss_step.backward()
+            if scaler:
+                scaler.scale(tr_loss_step).backward()
+            else:
+                tr_loss_step.backward()
             tr_loss += tr_loss_step
 
             if global_step % training_args.gradient_accumulation_steps == 0:
                 # print_grad(model)
-                optimizer.step()
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 lr_scheduler.step()
                 # print_param(model)
                 optimizer.clear_grad()
@@ -638,7 +672,7 @@ def main():
             global_step += 1
 
 
-def shard_model(model):
+def _shard_model(model):
     pp_stage = 0
     for name, layer in model.named_sublayers(include_self=False):
         if hasattr(layer, "ipp"):
@@ -665,6 +699,65 @@ def shard_model(model):
                 break
         if "lm_head" in name:
             shard_fn(layer, -1, [dist.Replicate(), dist.Shard(1)])
+
+
+def shard_model(model, training_args):
+    pp_stage = 0
+    for name, layer in model.named_sublayers(include_self=False):
+        if hasattr(layer, "ipp"):
+            pp_stage = layer.ipp
+        # print(f"name {name},pp_stage {pp_stage}==>", type(layer))
+        if "embed_tokens" in name:
+            # embedding only support column split now. it will update in the future
+            if training_args.sharding_parallel_degree == 1 and training_args.tensor_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Replicate()])
+            elif training_args.tensor_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Replicate()])
+            elif training_args.sharding_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Shard(1)])
+            else:
+                shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(1)])
+        for n in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.qkv_proj",
+            "gate_proj",
+            "up_proj",
+            "gate_up_fused_proj",
+        ]:
+            if n in name:
+                if training_args.sharding_parallel_degree == 1 and training_args.tensor_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Replicate()])
+                elif training_args.tensor_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Replicate()])
+                elif training_args.sharding_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Shard(1)])
+                else:
+                    shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(1)])
+                break
+        for n in ["self_attn.o_proj", "down_proj"]:
+            if n in name:
+                if training_args.sharding_parallel_degree == 1 and training_args.tensor_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Replicate()])
+                elif training_args.tensor_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Replicate()])
+                elif training_args.sharding_parallel_degree == 1:
+                    shard_fn(layer, pp_stage, [dist.Shard(0)])
+                else:
+                    shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(0)])
+                break
+        if "lm_head" in name:
+            if training_args.sharding_parallel_degree == 1 and training_args.tensor_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Replicate()])
+            elif training_args.tensor_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Replicate()])
+            elif training_args.sharding_parallel_degree == 1:
+                shard_fn(layer, pp_stage, [dist.Shard(1)])
+            else:
+                shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(1)])
+        # if "layernorm" in name:
+        #     shard_fn(layer, pp_stage, [dist.Replicate()])
 
 
 def load_model(model):

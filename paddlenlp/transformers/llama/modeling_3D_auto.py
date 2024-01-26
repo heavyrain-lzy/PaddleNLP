@@ -217,7 +217,7 @@ class LlamaRMSNormAuto(nn.Layer):
     def forward(self, hidden_states):
         if self.config.use_fused_rms_norm:
             tmp = rms_norm_fused(hidden_states, self.weight, self.variance_epsilon)
-            print(f"rms {tmp.placements}")
+            # print(f"rms {tmp.placements}")
             return tmp
 
         if paddle.in_dynamic_mode():

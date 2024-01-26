@@ -20,7 +20,7 @@ unset CUDA_VISIBLE_DEVICES
 export FLAGS_call_stack_level=3
 export FLAGS_use_cuda_managed_memory=true
 
-amp_strs=("fp16" "bf16")
+amp_strs=("fp16")
 for amp_str in "${amp_strs[@]}"; do
 fp16=fp16
 amp_enable=0
@@ -29,12 +29,12 @@ fp16=$amp_str
 amp_enable=1
 fi
 
-task_name="llama_auto_dp2mp2pp2_$amp_str"
+task_name="llama_auto_dp2mp2pp2_8$amp_str"
 rm -rf output/$task_name/
 rm -rf output/${task_name}_log
 
 export SOT_LOG_LEVEL=4
-export PYTHONPATH=../../../:$PYTHONPATH
+export PYTHONPATH=../../../:/root/paddlejob/Paddle/build_paddle/python/build/lib.linux-x86_64-3.10
 #ulimit -c unlimited
 #export GLOG_v=10
 
@@ -62,14 +62,14 @@ python3.10 -u  -m paddle.distributed.launch \
     --use_fused_rms_norm 1 \
     --${fp16} $amp_enable \
     --fp16_opt_level "O2"  \
-    --amp_master_grad 0 \
+    --amp_master_grad 1 \
     --scale_loss 1024 \
     --pipeline_parallel_degree 2 \
     --tensor_parallel_degree 2 \
     --sharding_parallel_degree 2 \
     --learning_rate 0.0001 \
     --min_learning_rate 0.00001 \
-    --max_steps 5000 \
+    --max_steps 5 \
     --save_steps 5000000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \
@@ -86,6 +86,6 @@ python3.10 -u  -m paddle.distributed.launch \
     --data_impl "mmap" \
     --parallel_mode "auto" \
     --max_grad_norm 1.0 \
-    # --num_hidden_layers 8 \
+    --num_hidden_layers 8 \
 
 done

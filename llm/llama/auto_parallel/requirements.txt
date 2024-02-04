@@ -1,0 +1,12 @@
+huggingface_hub
+colorlog
+safetensors
+aistudio_sdk
+jieba
+sentencepiece
+scipy
+datasets
+setuptools_scm
+seqeval
+fastapi
+tool_helpers

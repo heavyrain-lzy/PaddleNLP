@@ -29,12 +29,13 @@ fp16=$amp_str
 amp_enable=1
 fi
 
-task_name="llama_auto_dp2mp2pp2_8$amp_str"
+task_name="llama_auto_dp2mp2pp2_8_m$amp_str"
 rm -rf output/$task_name/
 rm -rf output/${task_name}_log
 
 export SOT_LOG_LEVEL=4
-export PYTHONPATH=../../../:/root/paddlejob/Paddle/build_paddle/python/build/lib.linux-x86_64-3.10
+# export PYTHONPATH=../../../:/root/paddlejob/Paddle/build_paddle/python/build/lib.linux-x86_64-3.10
+export PYTHONPATH=../../../
 #ulimit -c unlimited
 #export GLOG_v=10
 

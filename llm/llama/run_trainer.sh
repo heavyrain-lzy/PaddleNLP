@@ -19,12 +19,12 @@ rm -rf output/$task_name/
 rm -rf "output/$task_name""_log"
 
 
-PYTHONPATH=../../:$PYTHONPATH  \
+export PYTHONPATH=../../:/root/paddlejob/Paddle/build_paddle/python/build/lib.linux-x86_64-3.10
+
 python -u  -m paddle.distributed.launch \
     --gpus "0,1,2,3,4,5,6,7" \
     --log_dir "output/$task_name""_log" \
     run_pretrain.py \
-    --model_type "llama" \
     --model_name_or_path "facebook/llama-7b" \
     --tokenizer_name_or_path "facebook/llama-7b" \
     --input_dir "./data" \
@@ -32,12 +32,17 @@ python -u  -m paddle.distributed.launch \
     --split 949,50,1 \
     --max_seq_length 2048 \
     --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
+    --per_device_eval_batch_size 2 \
+    --gradient_accumulation_steps 2 \
     --use_flash_attention 1 \
     --use_fused_rms_norm 0 \
-    --fp16  \
+    --fp16 1 \
     --fp16_opt_level "O2"  \
+    --amp_master_grad 1 \
     --scale_loss 1024 \
+    --pipeline_parallel_degree 2 \
+    --tensor_parallel_degree 2 \
+    --sharding_parallel_degree 2 \
     --learning_rate 0.0001 \
     --min_learning_rate 0.00001 \
     --max_steps 10000 \
@@ -47,7 +52,7 @@ python -u  -m paddle.distributed.launch \
     --max_grad_norm 1.0 \
     --logging_steps 20\
     --dataloader_num_workers 1 \
-    --sharding "stage2" \
+    --sharding "" \
     --eval_steps 1000 \
     --report_to "visualdl" \
     --disable_tqdm true \

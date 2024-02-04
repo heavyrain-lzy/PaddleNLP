@@ -454,7 +454,7 @@ def main():
 
     config.tensor_parallel_degree = training_args.tensor_parallel_degree
     config.tensor_parallel_rank = training_args.tensor_parallel_rank
-
+    config.num_hidden_layers = 16
     # Config for model using dropout, such as GPT.
     config.hidden_dropout_prob = model_args.hidden_dropout_prob
     config.attention_probs_dropout_prob = model_args.attention_probs_dropout_prob

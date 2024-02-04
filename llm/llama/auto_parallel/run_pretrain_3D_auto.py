@@ -590,7 +590,7 @@ def main():
     scaler = None
     if training_args.fp16:
         scaler = paddle.amp.GradScaler(init_loss_scaling=training_args.scale_loss)
-        scaler = dist.shard_gradscaler(scaler)
+        scaler = dist.shard_scaler(scaler)
 
     # hack: create dp group for distributed input data to align dygraph parallel loss.
     dp_group = None
